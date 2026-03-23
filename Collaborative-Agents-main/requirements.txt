@@ -1,0 +1,13 @@
+# 数据处理
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# HuggingFace 核心库 (需保证较新版本以支持 Llama 3.1)
+transformers>=4.43.0
+datasets>=2.16.0
+accelerate>=0.32.0
+
+# 微调与量化库
+peft>=0.11.0
+trl>=0.9.6
+bitsandbytes>=0.43.1
