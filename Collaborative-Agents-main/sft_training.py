@@ -4,92 +4,120 @@ import json
 import pandas as pd
 import torch
 from datasets import Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
-from peft import LoraConfig, get_peft_model
-from trl import SFTTrainer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig
+from trl import SFTTrainer, SFTConfig
+from huggingface_hub import login
 
 # ==========================================
-# 第一部分：数据预处理 (CSV -> JSONL 格式)
+# 🛑 必填项：Hugging Face 授权 Token 
+# ==========================================
+# 请将你在第一步获取的以 hf_ 开头的 Token 粘贴在下面引号里
+HF_TOKEN = "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" 
+
+# ==========================================
+# 数据预处理模块
 # ==========================================
 def prepare_sft_dataset(data_dir):
-    print("开始处理 Excel 数据...")
-    # 【修改1】查找所有的 .xlsx 文件，而不是 .csv
-    all_excel_files = glob.glob(os.path.join(data_dir, "*.xlsx")) 
+    print(f"正在扫描数据文件夹: {data_dir}")
     
+    # 兼容搜索 xlsx 和 csv 格式
+    all_files = glob.glob(os.path.join(data_dir, "*.xlsx")) + glob.glob(os.path.join(data_dir, "*.csv"))
+    print(f"🔎 系统找到了 {len(all_files)} 个数据文件！")
+    
+    if len(all_files) == 0:
+        print("❌ 错误：没有找到任何文件！请绝对确认底部的 data_directory 路径是对的。")
+        return None
+
     formatted_data = []
     
-    for file in all_excel_files:
-        # 【修改2】使用 read_excel 直接读取 Excel 文件
-        # 注意：本地运行此代码需要额外安装 openpyxl 库 (pip install openpyxl)
-        df = pd.read_excel(file) 
-        
-        # 按照对话顺序重构历史
+    for file in all_files:
+        try:
+            if file.endswith('.xlsx'):
+                df = pd.read_excel(file)
+            else:
+                df = pd.read_csv(file)
+        except Exception as e:
+            print(f"读取文件 {file} 时出错: {e}")
+            continue
+            
         history = []
         for index, row in df.iterrows():
-            speaker = str(row['Origin'])
-            content = str(row['Content'])
+            # 兼容列名的大小写问题
+            col_origin = row.get('Origin', row.get('origin', 'Unknown'))
+            col_content = row.get('Content', row.get('content', ''))
+            col_intervention = row.get('intervention')
             
-            # 只有当模型确实做出了干预判断时，我们才把它作为一条训练数据
-            if pd.notna(row['intervention']):
-                # 提取目标标签，处理 NaN 或 0 的情况
-                stage = str(row['identified stage']) if pd.notna(row['identified stage']) and row['identified stage'] != '0' else "None"
-                issue = str(row['issue']) if pd.notna(row['issue']) and row['issue'] != '0' else "None"
-                intervention = str(row['intervention']).strip().lower()
-                feedback = str(row['guidance']) if pd.notna(row['guidance']) and row['guidance'] != '0' else "None"
-                
-                # 组装我们期望模型输出的 JSON 格式
-                target_dict = {
-                    "Stage": stage,
-                    "Issue": issue,
-                    "Intervene": "Yes" if intervention == 'yes' else "No",
-                    "Feedback Rule": feedback
-                }
-                target_json = json.dumps(target_dict, ensure_ascii=False)
-                
-                # 组装给模型的 Prompt (包含到目前为止的对话历史)
-                formatted_history = "\n".join(history)
-                prompt_text = f"以下是学生小组的讨论历史：\n{formatted_history}\n\n请根据探究社区(CoI)理论，诊断当前讨论的Stage(阶段)、Issue(问题)，并决定是否需要Intervene(干预)。如果需要，请提供Feedback Rule(反馈)。"
-                
-                # 使用 Llama-3 的官方 Chat Template 特殊 token 组装文本
-                # 这告诉模型：什么是系统指令，什么是用户输入，什么是标准答案
-                full_text = (
-                    "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
-                    "你是一个专业的协作学习辅导智能体。请严格以JSON格式输出诊断结果。<|eot_id|>"
-                    "<|start_header_id|>user<|end_header_id|>\n"
-                    f"{prompt_text}<|eot_id|>"
-                    "<|start_header_id|>assistant<|end_header_id|>\n"
-                    f"{target_json}<|eot_id|>"
-                )
-                
-                formatted_data.append({"text": full_text})
+            speaker = str(col_origin)
+            content = str(col_content)
             
-            # 将当前发言加入历史，供下一轮使用
+            if pd.notna(col_intervention) and str(col_intervention).strip() != '':
+                stage = str(row.get('identified stage', 'None'))
+                issue = str(row.get('issue', 'None'))
+                intervention = str(col_intervention).strip().lower()
+                guidance = str(row.get('guidance', 'None'))
+                
+                if stage != '0' and issue != '0':
+                    target_dict = {
+                        "Stage": stage,
+                        "Issue": issue,
+                        "Intervene": "Yes" if intervention == 'yes' else "No",
+                        "Feedback Rule": guidance
+                    }
+                    target_json = json.dumps(target_dict, ensure_ascii=False)
+                    
+                    formatted_history = "\n".join(history)
+                    prompt_text = f"以下是学生小组的讨论历史：\n{formatted_history}\n\n请根据探究社区(CoI)理论，诊断当前讨论的Stage(阶段)、Issue(问题)，并决定是否需要Intervene(干预)。如果需要，请提供Feedback Rule(反馈)。"
+                    
+                    full_text = (
+                        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
+                        "你是一个专业的协作学习辅导智能体。请严格以JSON格式输出诊断结果。<|eot_id|>"
+                        "<|start_header_id|>user<|end_header_id|>\n"
+                        f"{prompt_text}<|eot_id|>"
+                        "<|start_header_id|>assistant<|end_header_id|>\n"
+                        f"{target_json}<|eot_id|>"
+                    )
+                    formatted_data.append({"text": full_text})
+            
             history.append(f"{speaker}: {content}")
             
-    print(f"数据处理完成！共提取出 {len(formatted_data)} 条高质量对话轮次。")
+    print(f"✅ 数据处理完成！成功提取出 {len(formatted_data)} 条高质量训练数据。")
+    if len(formatted_data) == 0:
+        return None
     return Dataset.from_list(formatted_data)
 
-
 # ==========================================
-# 第二部分：SFT 监督微调 (QLoRA 训练模型)
+# 模型微调模块
 # ==========================================
 def train_sft_model(dataset):
-    print("开始加载模型与 Tokenizer...")
-    model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+    print("🚀 开始通过 Token 登录 Hugging Face...")
+    login(token=HF_TOKEN)
     
-    # 1. 加载分词器
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    # 使用 Qwen2.5-7B
+    model_id = "Qwen/Qwen2.5-7B-Instruct"
+    print(f"📥 正在拉取模型: {model_id} ...")
+    
+    tokenizer = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN)
     tokenizer.pad_token = tokenizer.eos_token
     
-    # 2. 以 4-bit 量化模式加载模型（这能把 8B 模型的显存占用从 16G 压到约 6-8G）
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, 
-        load_in_4bit=True, 
-        device_map="auto"
+    # 🌟 核心修改 1：使用最新的 NF4 4-bit 量化配置
+    quant_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16
     )
     
-    # 3. 配置 LoRA（低秩自适应微调）
-    # 论文中推荐我们微调注意力机制中的 q, v, k, o 矩阵
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, 
+        quantization_config=quant_config,  # 替换原来的 load_in_4bit=True
+        device_map="auto",
+        token=HF_TOKEN
+    )
+    
+    # 启用梯度检查点 (必须先在模型上开启)，这是 8GB/12GB 显卡救命的神器！
+    model.gradient_checkpointing_enable()
+    
     lora_config = LoraConfig(
         r=16, 
         lora_alpha=32, 
@@ -99,45 +127,51 @@ def train_sft_model(dataset):
         task_type="CAUSAL_LM"
     )
     
-    # 4. 配置训练参数 (按照原论文设置)
-    training_args = TrainingArguments(
-        output_dir="./CL-8B-SFT-Checkpoints",
-        per_device_train_batch_size=2,          # 显存不够可以改成 1
-        gradient_accumulation_steps=4,          # 变相扩大 Batch Size
-        learning_rate=5e-5,                     # 论文中指定的学习率
-        num_train_epochs=3,                     # 论文中指定的训练轮数
-        bf16=True,                              # 使用 bf16 精度加速训练
-        logging_steps=10,
-        save_strategy="epoch",
-        optim="paged_adamw_32bit",              # 节省显存的优化器
-    )
-    
-    # 5. 启动 SFTTrainer
+# 🌟 核心修改 2：把 TrainingArguments 换成 SFTConfig，并把参数搬进来
+# 🌟 核心修改：把 max_seq_length 移出去
+    training_args = SFTConfig(
+    output_dir="./CL-8B-SFT-Checkpoints",
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
+    learning_rate=5e-5,
+    num_train_epochs=3,
+
+    bf16=True,   # ✅ 开启 BF16
+    fp16=False,  # ❌ 关闭 FP16
+
+    logging_steps=10,
+    save_strategy="epoch",
+    optim="paged_adamw_32bit",
+    gradient_checkpointing=True,
+    max_grad_norm=0.3,
+    dataset_text_field="text",
+)
     trainer = SFTTrainer(
         model=model,
         train_dataset=dataset,
-        dataset_text_field="text",              # 指定数据集中包含合并文本的列名
         peft_config=lora_config,
-        max_seq_length=2048,                    # 控制上下文长度，防止显存溢出
         args=training_args,
     )
     
-    print("启动训练引擎！")
+    print("🔥 启动微调训练！RTX 5070 引擎点火！")
     trainer.train()
     
-    # 6. 保存最终的 LoRA 权重
     final_save_path = "./CL-8B-SFT-Final"
     trainer.model.save_pretrained(final_save_path)
     tokenizer.save_pretrained(final_save_path)
-    print(f"训练完成！模型已保存至 {final_save_path}")
-
+    print(f"🎉 训练大功告成！模型已保存至 {final_save_path}")
 
 if __name__ == "__main__":
-    # 替换成你电脑上 post-annotated Delidata 文件夹的实际路径
-    # 例如：data_directory = "./CLTeach/post-annotated Delidata"
-    data_directory = r"C:\Users\52771\Desktop\Collaborative-Agents-main\CLTeach\post-annotated Delidata"
-    # 1. 执行预处理
-    sft_dataset = prepare_sft_dataset(data_directory)
+    # ==========================================
+    # 🛑 必填项：检查你的数据路径！
+    # ==========================================
+    # 请确保路径里不要有中文字符，并且使用绝对路径，路径最前面保留 r
+    data_directory = r"C:\Users\52771\Desktop\Collaborative-Agents-main\CLTeach\CLTeach\post-annotated Delidata"
     
-    # 2. 执行微调
-    train_sft_model(sft_dataset)
+    sft_dataset = prepare_sft_dataset(data_dir=data_directory)
+    
+    # 增加强力拦截逻辑：只有成功读到数据，才去下载几十G的模型，避免浪费时间
+    if sft_dataset is not None and len(sft_dataset) > 0:
+        train_sft_model(sft_dataset)
+    else:
+        print("⛔ 训练被中止，因为没有提取到任何有效训练数据，请检查数据文件夹路径！")
